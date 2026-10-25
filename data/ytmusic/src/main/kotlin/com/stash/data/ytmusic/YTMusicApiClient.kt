@@ -1,6 +1,8 @@
 package com.stash.data.ytmusic
 
 import android.util.Log
+import com.stash.core.common.extensions.toCanonical
+import com.stash.core.common.splitArtistCredits
 import com.stash.core.model.SyncResult
 import com.stash.data.ytmusic.model.AlbumDetail
 import com.stash.data.ytmusic.model.AlbumSearch
@@ -656,33 +658,43 @@ class YTMusicApiClient @Inject constructor(
 
     /**
      * Resolve an artist name to its YouTube Music browse identity. Runs an
-     * artists-filtered search and returns the top [ArtistSummary] (browseId,
-     * name, avatar), or null when the name is blank / there is no artist result
-     * / on failure.
+     * artists-filtered search and returns the top [ArtistSummary] that
+     * actually names [name] (browseId, name, avatar), or null when the name
+     * is blank / no artist on the shelf matches it / on failure.
      *
      * Used by the Now Playing "tap track → artist profile" flow, where the
      * playing [com.stash.core.model.Track] carries only an artist NAME, not a
      * browseId. The name is passed raw (YT search handles multi-artist and
      * band-name credits); parsing reuses [parseArtistsShelf].
+     *
+     * The match guard matters: the shelf's FIRST artist is not always the
+     * searched one (a bigger namesake, a bandmate's solo page, a tribute
+     * act), and opening that profile shows an unrelated artist whose
+     * Popular shelf doesn't even contain the song the user came from
+     * (#666). [resolveAlbum] already refuses an unmatched top card the
+     * same way; callers here all handle null with a "couldn't find this
+     * artist" message, which beats confidently opening the wrong page.
      */
     suspend fun resolveArtist(name: String): ArtistSummary? {
         if (name.isBlank()) return null
         val response = innerTubeClient.search(name, params = ARTISTS_FILTER) ?: return null
-        return firstArtistOnShelf(response)
+        return selectArtist(artistsOnShelf(response), name)
     }
 
     /**
      * Resolve an artist name to its official photo for the artist-photo
-     * backfill. Same artists-filtered search as [resolveArtist], but returns a
-     * tri-state [ArtistPhotoResolution] so the worker can distinguish a
-     * GENUINE "no avatar" answer (stamp the permanent sentinel) from a request
-     * that never got an answer (retry on the next pass, like `ArtBackfillWorker`).
+     * backfill. Same artists-filtered search — and the same name-match
+     * guard, so the worker never stamps an unrelated artist's photo — as
+     * [resolveArtist], but returns a tri-state [ArtistPhotoResolution] so
+     * the worker can distinguish a GENUINE "no avatar" answer (stamp the
+     * permanent sentinel) from a request that never got an answer (retry
+     * on the next pass, like `ArtBackfillWorker`).
      */
     suspend fun resolveArtistPhoto(name: String): ArtistPhotoResolution {
         if (name.isBlank()) return ArtistPhotoResolution.NoAvatar
         val outcome = innerTubeClient.searchWithStatus(name, params = ARTISTS_FILTER)
         if (outcome.body == null) return ArtistPhotoResolution.Failed
-        val artist = firstArtistOnShelf(outcome.body)
+        val artist = selectArtist(artistsOnShelf(outcome.body), name)
         return if (artist != null) {
             ArtistPhotoResolution.Resolved(avatarUrl = artist.avatarUrl)
         } else {
@@ -690,21 +702,65 @@ class YTMusicApiClient @Inject constructor(
         }
     }
 
-    /** Top [ArtistSummary] from an artists-filtered search response, or null. */
-    private fun firstArtistOnShelf(response: JsonObject): ArtistSummary? {
+    /** Every [ArtistSummary] on an artists-filtered search response, in shelf order. */
+    private fun artistsOnShelf(response: JsonObject): List<ArtistSummary> {
         val shelves = response.navigatePath(
             "contents", "tabbedSearchResultsRenderer", "tabs",
         )?.firstArray()?.firstOrNull()?.asObject()
             ?.navigatePath("tabRenderer", "content", "sectionListRenderer", "contents")
             ?.asArray()
-            ?: return null
-        for (shelf in shelves) {
-            val renderer = shelf.asObject()?.get("musicShelfRenderer")?.asObject() ?: continue
-            val artists = parseArtistsShelf(renderer)
-            if (artists.isNotEmpty()) return artists.first()
+            ?: return emptyList()
+        return shelves.flatMap { shelf ->
+            shelf.asObject()?.get("musicShelfRenderer")?.asObject()
+                ?.let { parseArtistsShelf(it) }
+                .orEmpty()
         }
+    }
+
+    /**
+     * The first of [candidates] that names [wanted], credit part by credit
+     * part so the primary act of a joint credit ("A, B", "A feat. B") is
+     * preferred over a featured one. Exact (canonicalised) name equality is
+     * tried for every part before the looser either-contains-the-other
+     * overlap [artistsOverlap] uses for albums. Null when nobody on the
+     * shelf matches — an honest "not found", never the unrelated top hit.
+     */
+    private fun selectArtist(candidates: List<ArtistSummary>, wanted: String): ArtistSummary? {
+        if (candidates.isEmpty()) return null
+        val candidateKeys = candidates.map { artistMatchKey(it.name) }
+        val wantedParts = (
+            wanted.splitArtistCredits().ifEmpty { listOf(wanted) } + wanted
+            ).map { artistMatchKey(it) }.filter { it.isNotEmpty() }.distinct()
+        for (part in wantedParts) {
+            val exact = candidateKeys.indexOf(part)
+            if (exact >= 0) return candidates[exact]
+        }
+        for (part in wantedParts) {
+            val overlap = candidateKeys.indexOfFirst { key ->
+                key.length >= 3 && part.length >= 3 && (key.contains(part) || part.contains(key))
+            }
+            if (overlap >= 0) return candidates[overlap]
+        }
+        Log.d(
+            TAG,
+            "resolveArtist: no artist on the shelf matches '$wanted' " +
+                "(top was '${candidates.first().name}') — not opening an unrelated profile",
+        )
         return null
     }
+
+    /**
+     * Canonical key for artist-name equality: case- and diacritic-folded
+     * ([com.stash.core.common.extensions.toCanonical] also drops feat./ft.
+     * tags and bracketed asides), then punctuation removed so "AC/DC" and
+     * "AC DC" agree. Unicode letters are kept — a key built from ASCII
+     * alone would erase non-Latin names entirely and never match them.
+     */
+    private fun artistMatchKey(raw: String): String =
+        raw.toCanonical()
+            .replace(Regex("[^\\p{L}\\p{N} ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
     /**
      * Fetch a YouTube Music artist browse page in one round-trip and parse it

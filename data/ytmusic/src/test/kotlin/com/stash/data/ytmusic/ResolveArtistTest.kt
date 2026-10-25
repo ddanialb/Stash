@@ -67,6 +67,29 @@ class ResolveArtistTest {
         verifyBlocking(inner, never()) { search(any(), any()) }
     }
 
+    // #666: the fixture shelf is [My Bloody Valentine, Kevin Shields]. The
+    // resolver used to return the first entry whatever was searched, so a
+    // tap on Kevin Shields (or on a Radiohead track) opened MBV's page.
+
+    @Test fun `resolveArtist picks the artist that matches, not the first on the shelf`() = runTest {
+        val client = fakeClient(loadFixture("search_artists_filter.json"))
+        val result = client.resolveArtist("Kevin Shields")
+        assertEquals("UCotherKevinShields", result?.id)
+        assertEquals("Kevin Shields", result?.name)
+    }
+
+    @Test fun `resolveArtist returns null when nobody on the shelf matches`() = runTest {
+        val client = fakeClient(loadFixture("search_artists_filter.json"))
+        assertNull(client.resolveArtist("Radiohead"))
+    }
+
+    @Test fun `resolveArtist prefers the primary act of a joint credit`() = runTest {
+        val client = fakeClient(loadFixture("search_artists_filter.json"))
+        // Shelf order is MBV first; the credit names Kevin Shields first.
+        val result = client.resolveArtist("Kevin Shields, My Bloody Valentine")
+        assertEquals("Kevin Shields", result?.name)
+    }
+
     @Test fun `resolveArtistPhoto resolves an avatar when an artist shelf exists`() = runTest {
         val client = fakeClient(loadFixture("search_artists_filter.json"))
         val result = client.resolveArtistPhoto("my bloody valentine")
@@ -77,6 +100,13 @@ class ResolveArtistTest {
     @Test fun `resolveArtistPhoto is NoAvatar when the API answered without an artist`() = runTest {
         val client = fakeClient("""{"contents":{}}""")
         assertEquals(ArtistPhotoResolution.NoAvatar, client.resolveArtistPhoto("nobody"))
+    }
+
+    @Test fun `resolveArtistPhoto is NoAvatar when the shelf names only other artists`() = runTest {
+        // Answered, but nobody matching: a genuine no-photo result, never
+        // the unrelated top artist's photo stamped onto this artist.
+        val client = fakeClient(loadFixture("search_artists_filter.json"))
+        assertEquals(ArtistPhotoResolution.NoAvatar, client.resolveArtistPhoto("Radiohead"))
     }
 
     @Test fun `resolveArtistPhoto is Failed when the API did not answer`() = runTest {
