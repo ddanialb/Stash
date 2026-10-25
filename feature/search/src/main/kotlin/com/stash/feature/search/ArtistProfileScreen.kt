@@ -217,25 +217,44 @@ fun ArtistProfileScreen(
                     )
                 }
                 ArtistProfileStatus.Fresh,
-                ArtistProfileStatus.Stale -> contentSections(
-                    state = state,
-                    previewState = previewState,
-                    downloadingIds = downloadingIds,
-                    downloadedIds = downloadedIds,
-                    previewLoadingId = previewLoadingId,
-                    currentPlayingYoutubeId = currentPlayingYoutubeId,
-                    losslessPrefetcher = vm.losslessPrefetcher,
-                    onPreview = { track -> vm.delegate.previewTrack(track) },
-                    onStopPreview = vm.delegate::stopPreview,
-                    onDownload = { vm.delegate.downloadTrack(it.toTrackItem()) },
-                    onPlayNext = vm::onPlayNext,
-                    onAddToQueue = vm::onAddToQueue,
-                    onStartRadio = vm::onStartRadio,
-                    onRequestAddToPlaylist = vm::onRequestAddToPlaylist,
-                    onNavigateToAlbum = onNavigateToAlbum,
-                    onNavigateToArtist = onNavigateToArtist,
-                    focus = focus,
-                )
+                ArtistProfileStatus.Stale -> if (
+                    state.popular.isEmpty() && state.albums.isEmpty() &&
+                    state.singles.isEmpty() && state.related.isEmpty() && state.about == null
+                ) {
+                    // Loaded, but YouTube Music returned nothing to show. The
+                    // shelves below would render as a blank page under the
+                    // hero with no way forward (#403/#666) — say so, and let
+                    // the user force a refetch in place (e.g. right after
+                    // turning a VPN on) instead of leaving and reopening.
+                    item {
+                        DiscoveryErrorCard(
+                            title = "No songs found",
+                            message = "YouTube Music didn't return any songs for this artist. " +
+                                "If your connection just changed, tap Retry.",
+                            onRetry = vm::retry,
+                        )
+                    }
+                } else {
+                    contentSections(
+                        state = state,
+                        previewState = previewState,
+                        downloadingIds = downloadingIds,
+                        downloadedIds = downloadedIds,
+                        previewLoadingId = previewLoadingId,
+                        currentPlayingYoutubeId = currentPlayingYoutubeId,
+                        losslessPrefetcher = vm.losslessPrefetcher,
+                        onPreview = { track -> vm.delegate.previewTrack(track) },
+                        onStopPreview = vm.delegate::stopPreview,
+                        onDownload = { vm.delegate.downloadTrack(it.toTrackItem()) },
+                        onPlayNext = vm::onPlayNext,
+                        onAddToQueue = vm::onAddToQueue,
+                        onStartRadio = vm::onStartRadio,
+                        onRequestAddToPlaylist = vm::onRequestAddToPlaylist,
+                        onNavigateToAlbum = onNavigateToAlbum,
+                        onNavigateToArtist = onNavigateToArtist,
+                        focus = focus,
+                    )
+                }
             }
         }
 

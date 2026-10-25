@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -138,20 +139,30 @@ class ArtistCache(
      *                        `refreshFailed = true` on refresh failure.
      *
      * Miss failures propagate (no cached copy to fall back to); callers
-     * handle them via Flow's normal error channel.
+     * handle them via Flow's normal error channel. A browse that never
+     * answered arrives here as a blank-name, shelf-less profile (see
+     * [ArtistProfile.isNoAnswer]); that is a miss failure, never a `Fresh`
+     * to persist — kept, it was an empty page with no Retry for the whole
+     * TTL even after the connection came back (#403), the same failure
+     * [AlbumCache] already guards against for albums (#481).
+     *
+     * [forceRefresh] treats even a within-TTL hit as stale, so an explicit
+     * user Retry always asks the network again instead of re-serving the
+     * cached copy it is retrying from.
      */
-    fun get(artistId: String): Flow<CachedProfile> = flow {
+    fun get(artistId: String, forceRefresh: Boolean = false): Flow<CachedProfile> = flow {
         val hit = synchronized(memory) { memory[artistId] } ?: dao.get(artistId)
-        if (hit != null) {
+        val cachedProfile = hit?.let { json.decodeFromString<ArtistProfile>(it.json) }
+        if (hit != null && cachedProfile != null && !cachedProfile.isNoAnswer()) {
             // Warm the memory tier (promotes to MRU in access order).
             synchronized(memory) { memory[artistId] = hit }
-            val cachedProfile = json.decodeFromString<ArtistProfile>(hit.json)
             val age = now() - hit.fetchedAt
-            if (age < TTL_MS) {
+            if (age < TTL_MS && !forceRefresh) {
                 emit(CachedProfile.Fresh(cachedProfile))
                 return@flow
             }
-            // Past TTL — surface stale data first, then try to refresh.
+            // Past TTL (or a forced refresh) — surface stale data first,
+            // then try to refresh.
             emit(CachedProfile.Stale(cachedProfile))
             try {
                 val refreshed = fetchAndMerge(artistId)
@@ -164,9 +175,20 @@ class ArtistCache(
                 if (t is CancellationException) throw t
                 // Don't blow up the screen — the user already has usable data.
                 // Surface the refresh failure for the ViewModel's Snackbar.
+                // The good row is left untouched (and its fetchedAt is NOT
+                // re-stamped), so the next open retries the refresh instead
+                // of serving the failed answer as Fresh.
                 emit(CachedProfile.Stale(cachedProfile, refreshFailed = true))
             }
             return@flow
+        }
+        if (cachedProfile != null && cachedProfile.isNoAnswer()) {
+            // A row persisted by a version without the guard above: a
+            // no-answer browse kept as if it were the artist. Drop the
+            // memory copy and fall through to the cold fetch so an already
+            // stuck artist heals on its next open; the disk row is
+            // overwritten by persist() on success.
+            synchronized(memory) { memory.remove(artistId) }
         }
 
         // Cold miss: no memory or disk tier hit — network is the source of truth.
@@ -174,7 +196,7 @@ class ArtistCache(
         // enrichments used to gate the first paint, and a slow MusicBrainz
         // lookup made an uncached artist page take 13.8 s on a Pixel 6
         // (2026-09-08); the YouTube data was ready at 3.4 s.
-        val yt = api.getArtist(artistId)
+        val yt = fetchOrThrow(artistId)
         emit(CachedProfile.Partial(yt))
         val profile = enrich(yt)
         persist(profile)
@@ -192,7 +214,35 @@ class ArtistCache(
      * call can hang and must not stall the artist page.
      */
     private suspend fun fetchAndMerge(artistId: String): ArtistProfile =
-        enrich(api.getArtist(artistId))   // REQUIRED — failure propagates
+        enrich(fetchOrThrow(artistId))   // REQUIRED — failure propagates
+
+    /**
+     * [YTMusicApiClient.getArtist] does not throw when the browse never
+     * comes back (offline, ISP/VPN block, InnerTube 4xx/5xx): it answers a
+     * blank-name, shelf-less profile, and its contract says callers should
+     * treat a blank name as a "retry" signal. Turn that signal into the
+     * failure it is — the same guard [AlbumCache] applies to `getAlbum`'s
+     * blank, track-less answer (#481) — so a cold miss reaches the caller
+     * through the error channel (Error card + Retry, nothing persisted)
+     * and a stale refresh keeps the good cached profile visible.
+     */
+    private suspend fun fetchOrThrow(artistId: String): ArtistProfile =
+        api.getArtist(artistId).also {
+            if (it.isNoAnswer()) {
+                throw IOException("YouTube Music didn't return artist $artistId")
+            }
+        }
+
+    /**
+     * The profile a browse that never answered produces. A real artist
+     * page always carries its name in the header — even the sparse
+     * fixture, with only a Popular shelf, has one — so a blank name with
+     * no shelves at all can only be the no-answer placeholder, never a
+     * genuine (if empty) artist worth caching.
+     */
+    private fun ArtistProfile.isNoAnswer(): Boolean =
+        name.isBlank() &&
+            popular.isEmpty() && albums.isEmpty() && singles.isEmpty() && related.isEmpty()
 
     /** The two best-effort supplements, in parallel, each bounded; either may fall back to the YouTube data. */
     private suspend fun enrich(yt: ArtistProfile): ArtistProfile = coroutineScope {

@@ -171,21 +171,24 @@ class ArtistProfileViewModel @Inject constructor(
      * Subscribes to [ArtistCache.get] for [artistId] and folds each emission
      * into the UI state. Extracted into a suspend function so [retry] can
      * re-run the exact same pipeline after a cold-miss failure without
-     * duplicating the body.
+     * duplicating the body. [forceRefresh] is forwarded on a retry so the
+     * cache asks the network again even for a within-TTL hit.
      */
-    private suspend fun observeCache() {
+    private suspend fun observeCache(forceRefresh: Boolean = false) {
         val t0 = SystemClock.elapsedRealtime()
-        artistCache.get(artistId)
+        artistCache.get(artistId, forceRefresh)
             .catch { t ->
                 // Cold miss with no cached fallback — the flow throws and
                 // would otherwise crash viewModelScope. Flip to Error and
                 // let the screen render a message instead. `flow.catch`
                 // intentionally does not swallow CancellationException.
                 Log.e(TAG, "cache failure for $artistId", t)
+                // The raw failure stays in the log above: its message can
+                // carry the browseId ("YouTube Music didn't return artist
+                // UC…"), which is noise on the error card. Show the same
+                // fixed copy as the album screen instead.
                 _uiState.value = _uiState.value.copy(
-                    status = ArtistProfileStatus.Error(
-                        t.message ?: "Something went wrong.",
-                    ),
+                    status = ArtistProfileStatus.Error(LOAD_FAILED),
                 )
                 _userMessages.emit("Couldn't load artist — tap Retry.")
             }
@@ -222,11 +225,16 @@ class ArtistProfileViewModel @Inject constructor(
      * calls this from its error-card "Retry" button. Flips status back to
      * [ArtistProfileStatus.Loading] before relaunching so the error card
      * disappears while the new subscription is in flight.
+     *
+     * The relaunch forces a refresh: a plain re-subscription could be
+     * served the very cached copy the user is retrying from, without a
+     * network call, until the 6-hour TTL expired. That is #403 — turn the
+     * VPN on, tap Retry, and the page must actually ask again in place.
      */
     fun retry() {
         cacheJob?.cancel()
         _uiState.update { it.copy(status = ArtistProfileStatus.Loading) }
-        cacheJob = viewModelScope.launch { observeCache() }
+        cacheJob = viewModelScope.launch { observeCache(forceRefresh = true) }
     }
 
     /**
@@ -380,11 +388,15 @@ class ArtistProfileViewModel @Inject constructor(
         status: ArtistProfileStatus,
         t0: Long,
     ) {
+        // A profile whose header didn't parse must not blank the hero the
+        // nav args (or an earlier, good emission) already painted — fall
+        // back to what is on screen for any field the profile lacks.
+        val currentHero = _uiState.value.hero
         _uiState.value = _uiState.value.copy(
             hero = HeroState(
-                name = profile.name,
-                avatarUrl = profile.avatarUrl,
-                subscribersText = profile.subscribersText,
+                name = profile.name.ifBlank { currentHero.name },
+                avatarUrl = profile.avatarUrl ?: currentHero.avatarUrl,
+                subscribersText = profile.subscribersText ?: currentHero.subscribersText,
             ),
             popular = profile.popular,
             albums = profile.albums,
@@ -419,6 +431,9 @@ class ArtistProfileViewModel @Inject constructor(
          * through [PerfLog] (tag `Perf`) and do NOT use [TAG].
          */
         private const val TAG = "ArtistProfileVM"
+
+        /** User-facing copy for a failed profile load — same wording as the album screen. */
+        internal const val LOAD_FAILED = "Check your connection and try again."
 
         /**
          * Soft cap on the total tracks the Play Artist hybrid-fill will

@@ -115,7 +115,7 @@ class ArtistProfileViewModelTest {
     @Test
     fun `initial state paints hero from nav args before cache emits`() = runTest {
         val cache = mock<ArtistCache>()
-        whenever(cache.get(any())).thenReturn(flow { /* never emits */ })
+        whenever(cache.get(any(), any())).thenReturn(flow { /* never emits */ })
         val vm = vmWith(cache)
         vm.uiState.test {
             val first = awaitItem()
@@ -139,11 +139,34 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
         val pf = mock<PreviewPrefetcher>()
         vmWith(cache, pf)
         advanceUntilIdle()
         verify(pf).prefetch(eq(listOf("v1", "v2")))
+    }
+
+    @Test
+    fun `a profile with a blank name does not blank the hero painted from nav args`() = runTest {
+        // Header didn't parse but shelves did: the hero the user tapped
+        // through with (nav args) must survive, not be overwritten by "".
+        val profile = ArtistProfile(
+            id = "UC1",
+            name = "",
+            avatarUrl = null,
+            subscribersText = null,
+            popular = listOf(t("v1")),
+            albums = emptyList(),
+            singles = emptyList(),
+            related = emptyList(),
+        )
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        val vm = vmWith(cache)
+        advanceUntilIdle()
+        assertEquals("LocalName", vm.uiState.value.hero.name)
+        assertEquals("u", vm.uiState.value.hero.avatarUrl)
+        assertTrue(vm.uiState.value.status is ArtistProfileStatus.Fresh)
     }
 
     @Test
@@ -159,7 +182,7 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(
             flow {
                 emit(CachedProfile.Stale(cachedProfile))
                 emit(CachedProfile.Stale(cachedProfile, refreshFailed = true))
@@ -176,7 +199,28 @@ class ArtistProfileViewModelTest {
     }
 
     @Test
-    fun `retry flips status to Loading and re-subscribes to cache`() = runTest {
+    fun `cache failure transitions to Error with connection copy, never the raw failure text`() = runTest {
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(
+            flow { throw java.io.IOException("YouTube Music didn't return artist UC1") },
+        )
+        val vm = vmWith(cache)
+
+        vm.userMessages.test {
+            advanceUntilIdle()
+            assertEquals("Couldn't load artist — tap Retry.", awaitItem())
+            cancelAndIgnoreRemainingEvents()
+        }
+        // Mirrors the album screen (#481): fixed copy on the error card;
+        // the browseId-carrying exception text stays in the log.
+        assertEquals(
+            ArtistProfileStatus.Error("Check your connection and try again."),
+            vm.uiState.value.status,
+        )
+    }
+
+    @Test
+    fun `retry flips status to Loading and re-subscribes to cache with a forced refresh`() = runTest {
         val profile = ArtistProfile(
             id = "UC1",
             name = "A",
@@ -188,10 +232,11 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        // First subscription emits Fresh; second subscription (after retry)
-        // also emits Fresh. We verify the VM calls get() twice — once on
-        // init, once on retry() — and that status flips through Loading.
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        // First subscription (init, unforced) emits Fresh; the subscription
+        // after retry must be forced, or the cache could answer from its
+        // TTL without a network call and Retry would change nothing (#403).
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(true))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
         val vm = vmWith(cache)
         advanceUntilIdle()
         assertTrue(vm.uiState.value.status is ArtistProfileStatus.Fresh)
@@ -203,7 +248,8 @@ class ArtistProfileViewModelTest {
 
         advanceUntilIdle()
         assertTrue(vm.uiState.value.status is ArtistProfileStatus.Fresh)
-        verify(cache, org.mockito.kotlin.times(2)).get(eq("UC1"))
+        verify(cache).get(eq("UC1"), eq(false))
+        verify(cache).get(eq("UC1"), eq(true))
     }
 
     @Test
@@ -213,7 +259,7 @@ class ArtistProfileViewModelTest {
             popular = emptyList(), albums = emptyList(), singles = emptyList(), related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
         val player = mock<PlayerRepository> {
             onBlocking { startRadio(any(), any()) } doReturn com.stash.core.model.RadioStartResult.Started
         }
@@ -243,7 +289,7 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
         val player = mock<PlayerRepository>()
         val vm = vmWith(cache = cache, playerRepository = player)
         advanceUntilIdle()
@@ -280,7 +326,7 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
 
         val albumDetail = AlbumDetail(
             id = "ALB1",
@@ -326,7 +372,7 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
         val player = mock<PlayerRepository>()
         val vm = vmWith(cache = cache, playerRepository = player)
         advanceUntilIdle()
@@ -362,7 +408,7 @@ class ArtistProfileViewModelTest {
             related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
 
         // First albumCache.get suspends forever; the second tap must cancel
         // the first job before it can append anything from the album.
@@ -416,7 +462,7 @@ class ArtistProfileViewModelTest {
             singles = emptyList(), related = emptyList(),
         )
         val cache = mock<ArtistCache>()
-        whenever(cache.get(eq("UC1"))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
 
         val albumCache = mock<AlbumCache>()
         whenever(
