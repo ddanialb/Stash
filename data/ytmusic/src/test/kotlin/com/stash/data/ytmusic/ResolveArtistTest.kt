@@ -90,6 +90,18 @@ class ResolveArtistTest {
         assertEquals("Kevin Shields", result?.name)
     }
 
+    @Test fun `resolveArtist matches a name with a comma whole before its parts`() = runTest {
+        // The same shelf renamed [Peter, "Peter, Bjorn and John"]: split into credits (the name
+        // isn't on the allowlist), the searched name names the first entry ("Peter") exactly; the
+        // whole name is the second.
+        val shelf = loadFixture("search_artists_filter.json")
+            .replace("My Bloody Valentine", "Peter")
+            .replace("Kevin Shields", "Peter, Bjorn and John")
+        val result = fakeClient(shelf).resolveArtist("Peter, Bjorn and John")
+        assertEquals("UCotherKevinShields", result?.id)
+        assertEquals("Peter, Bjorn and John", result?.name)
+    }
+
     @Test fun `resolveArtistPhoto resolves an avatar when an artist shelf exists`() = runTest {
         val client = fakeClient(loadFixture("search_artists_filter.json"))
         val result = client.resolveArtistPhoto("my bloody valentine")

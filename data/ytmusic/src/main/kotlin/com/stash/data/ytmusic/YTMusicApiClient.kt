@@ -718,19 +718,20 @@ class YTMusicApiClient @Inject constructor(
     }
 
     /**
-     * The first of [candidates] that names [wanted], credit part by credit
-     * part so the primary act of a joint credit ("A, B", "A feat. B") is
-     * preferred over a featured one. Exact (canonicalised) name equality is
-     * tried for every part before the looser either-contains-the-other
+     * The first of [candidates] that names [wanted]: the whole credit first,
+     * since a name can hold a comma ("Peter, Bjorn and John" split into credits
+     * names a "Peter" who may be on the shelf too), then credit part by
+     * credit part so the primary act of a joint credit ("A, B", "A feat. B")
+     * is preferred over a featured one. Exact (canonicalised) name equality
+     * is tried for every part before the looser either-contains-the-other
      * overlap [artistsOverlap] uses for albums. Null when nobody on the
      * shelf matches — an honest "not found", never the unrelated top hit.
      */
     private fun selectArtist(candidates: List<ArtistSummary>, wanted: String): ArtistSummary? {
         if (candidates.isEmpty()) return null
         val candidateKeys = candidates.map { artistMatchKey(it.name) }
-        val wantedParts = (
-            wanted.splitArtistCredits().ifEmpty { listOf(wanted) } + wanted
-            ).map { artistMatchKey(it) }.filter { it.isNotEmpty() }.distinct()
+        val wantedParts = (listOf(wanted) + wanted.splitArtistCredits())
+            .map { artistMatchKey(it) }.filter { it.isNotEmpty() }.distinct()
         for (part in wantedParts) {
             val exact = candidateKeys.indexOf(part)
             if (exact >= 0) return candidates[exact]
