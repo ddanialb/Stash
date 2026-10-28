@@ -30,6 +30,7 @@ enum class NowPlayingAction {
      * sheet, to change them mid-listen without leaving the song (#716). Only while songs stream.
      */
     STREAM_QUALITY,
+    AUTOMIX,
     DOWNLOAD,
     FLAG_WRONG_MATCH,
     ;

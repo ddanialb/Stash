@@ -21,6 +21,7 @@ import com.stash.core.data.library.TrackSourceRule
 import com.stash.core.data.mapper.toDomain
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.data.repository.MusicRepository
+import com.stash.core.media.automix.AutoMixStateBus
 import com.stash.core.media.diagnostics.PlaybackDiagnosticsLog
 import com.stash.core.media.service.StashPlaybackService
 import com.stash.core.media.streaming.ConnectivityMonitor
@@ -122,6 +123,7 @@ class PlayerRepositoryImpl @Inject constructor(
     private val diagnosticsLog: PlaybackDiagnosticsLog = PlaybackDiagnosticsLog(),
     // Data saver: the next-song look-ahead is skipped where it applies. Null in hand-built tests (never applies).
     private val qualityPolicy: com.stash.core.media.streaming.StreamQualityPolicy? = null,
+    private val autoMixStateBus: AutoMixStateBus = AutoMixStateBus(),
 ) : PlayerRepository {
 
     /**
@@ -3437,7 +3439,11 @@ class PlayerRepositoryImpl @Inject constructor(
             noteCurrentItem(controller, reason)
             // Safety net: keep the chosen speed across transitions / queue rebuilds. Not in a session,
             // where drift correction nudges the speed on purpose.
-            if (!listenTogetherOwnsQueue && controller.playbackParameters.speed != _playbackSpeed.value) {
+            val returningFromAutoMix = autoMixStateBus.state.value.isTempoReturnFor(
+                mediaItem?.mediaId,
+                android.os.SystemClock.elapsedRealtime(),
+            )
+            if (!listenTogetherOwnsQueue && !returningFromAutoMix && controller.playbackParameters.speed != _playbackSpeed.value) {
                 controller.setPlaybackSpeed(_playbackSpeed.value)
             }
             // Defense in depth: the existing onPlayerError recovery catches

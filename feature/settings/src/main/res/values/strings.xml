@@ -1176,4 +1176,10 @@
     <string name="soundcloud_disconnect">Disconnect SoundCloud</string>
     <string name="soundcloud_disconnect_body">Stop syncing this account. Your library and downloaded files stay here.</string>
     <string name="soundcloud_cancel">Cancel</string>
+    <string name="settings_automix_title">AutoMix</string>
+    <string name="settings_automix_desc">DJ-style transitions between songs. Takes priority over Crossfade.</string>
+    <string name="settings_automix_beat_sync">Beat Sync</string>
+    <string name="settings_automix_smooth">Smooth</string>
+    <string name="settings_automix_beat_sync_desc">Sync the songs first, keep them beat-locked for several bars, then ease the new song back to its own tempo.</string>
+    <string name="settings_automix_smooth_desc">A longer blend from each song\'s audible end to the next song\'s start, without changing tempo.</string>
 </resources>
