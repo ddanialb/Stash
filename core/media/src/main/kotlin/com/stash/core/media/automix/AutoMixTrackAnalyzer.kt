@@ -10,6 +10,8 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.MediaItem
 import com.stash.core.data.db.dao.TrackDao
+import com.stash.core.data.db.entity.TrackEntity
+import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.media.service.StashPlaybackService
 import com.stash.core.media.streaming.CloudCopyFinder
 import com.stash.core.media.streaming.STASH_RESOLVE_SCHEME
@@ -17,13 +19,20 @@ import com.stash.core.media.streaming.StreamSourceRegistry
 import com.stash.core.media.streaming.StreamUrl
 import com.stash.core.media.streaming.StreamUrlCache
 import com.stash.core.media.streaming.placeholderEntity
+import com.stash.core.media.streaming.usableDownload
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -34,38 +43,105 @@ import kotlin.math.min
 
 enum class AutoMixWindow { HEAD, TAIL }
 
+/**
+ * Runs analysis in the caller's coroutine, with a hard concurrency cap.
+ *
+ * This deliberately does not launch work into a singleton scope: when playback
+ * cancels its active pair (a skip, a queue change, or AutoMix being switched
+ * off), the decode/FFT work below is a child of that cancelled call and stops
+ * with it. Waiting for a permit is cancellable too, so rapid skips cannot leave
+ * a queue of abandoned decoders behind. Completed analyses are still cached.
+ */
+internal class AutoMixAnalysisRunner<T : Any>(
+    maxConcurrent: Int = MAX_CONCURRENT_ANALYSES,
+    private val maxCached: Int = MAX_CACHED_ANALYSES,
+) {
+    private val semaphore = Semaphore(maxConcurrent.coerceAtLeast(1))
+    private val completed = ConcurrentHashMap<String, T>()
+
+    suspend fun run(key: String, work: suspend () -> T?): T? {
+        currentCoroutineContext().ensureActive()
+        completed[key]?.let { return it }
+        return semaphore.withPermit {
+            currentCoroutineContext().ensureActive()
+            completed[key]?.let { return@withPermit it }
+            work()?.also { result ->
+                if (completed.size > maxCached) completed.clear()
+                completed[key] = result
+            }
+        }
+    }
+
+    internal companion object {
+        const val MAX_CONCURRENT_ANALYSES = 2
+        const val MAX_CACHED_ANALYSES = 24
+    }
+}
+
+/**
+ * The Download/Stream-only policy for work that would read audio over the
+ * network. [withCancellation] also observes the switch while the work is
+ * running: flipping to Download mode mid-resolve or mid-decode cancels the
+ * current caller instead of letting the extraction finish in the background.
+ */
+internal class AutoMixRemotePolicy(private val streamAllowed: Flow<Boolean>) {
+    suspend fun isAllowed(): Boolean = streamAllowed.first()
+
+    suspend fun <T> withCancellation(block: suspend () -> T): T {
+        if (!isAllowed()) throw CancellationException("AutoMix remote analysis refused in Download mode")
+        return coroutineScope {
+            val watcher = launch {
+                streamAllowed.first { allowed -> !allowed }
+                this@coroutineScope.cancel(
+                    CancellationException("AutoMix remote analysis cancelled: Download mode"),
+                )
+            }
+            try {
+                block()
+            } finally {
+                watcher.cancel()
+            }
+        }
+    }
+}
+
 @Singleton
 class AutoMixTrackAnalyzer @Inject constructor(
     @ApplicationContext private val context: Context,
     private val streamUrlCache: StreamUrlCache,
     private val streamResolver: StreamSourceRegistry,
     private val trackDao: TrackDao,
+    streamingPreference: StreamingPreference,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val completed = ConcurrentHashMap<String, AutoMixTrackAnalysis>()
-    private val inFlight = ConcurrentHashMap<String, Deferred<AutoMixTrackAnalysis?>>()
+    private val analysisRunner = AutoMixAnalysisRunner<AutoMixTrackAnalysis>()
+    private val remotePolicy = AutoMixRemotePolicy(streamingPreference.enabled)
 
     suspend fun analyze(item: MediaItem, window: AutoMixWindow, knownDurationMs: Long = 0L): AutoMixTrackAnalysis? {
+        currentCoroutineContext().ensureActive()
         val uriKey = item.localConfiguration?.uri?.toString().orEmpty()
         val key = "${item.mediaId}|$window|$knownDurationMs|${uriKey.hashCode()}"
-        completed[key]?.let { return it }
-        inFlight[key]?.let { return it.await() }
-        val deferred = scope.async { analyzeInternal(item, window, knownDurationMs) }
-        val raceWinner = inFlight.putIfAbsent(key, deferred)
-        val chosen = raceWinner ?: deferred
-        if (raceWinner != null) deferred.cancel()
-        return try {
-            chosen.await()?.also { analysis ->
-                if (completed.size > MAX_CACHED_ANALYSES) completed.clear()
-                completed[key] = analysis
-            }
-        } finally { inFlight.remove(key, chosen) }
+        return analysisRunner.run(key) { analyzeInternal(item, window, knownDurationMs) }
     }
 
     private suspend fun analyzeInternal(item: MediaItem, window: AutoMixWindow, knownDurationMs: Long): AutoMixTrackAnalysis? {
+        currentCoroutineContext().ensureActive()
         val uri = resolveAnalysisUri(item) ?: return null
-        val decoded = withContext(Dispatchers.IO) { decodeWindow(uri, window, knownDurationMs) } ?: return null
-        val beatWindow = AutoMixBeatAnalyzer.analyze(decoded.samples, decoded.sampleRate, decoded.windowStartMs) ?: return null
+
+        suspend fun decodeAndAnalyze(): Pair<DecodedWindow, BeatWindowAnalysis>? {
+            val decoded = withContext(Dispatchers.IO) { decodeWindow(uri, window, knownDurationMs) } ?: return null
+            currentCoroutineContext().ensureActive()
+            val beatWindow = withContext(Dispatchers.Default) {
+                AutoMixBeatAnalyzer.analyze(decoded.samples, decoded.sampleRate, decoded.windowStartMs)
+            } ?: return null
+            return decoded to beatWindow
+        }
+
+        val (decoded, beatWindow) = if (uri.isNetworkUri()) {
+            remotePolicy.withCancellation { decodeAndAnalyze() }
+        } else {
+            decodeAndAnalyze()
+        } ?: return null
+        currentCoroutineContext().ensureActive()
         val durationMs = decoded.durationMs.takeIf { it > 0L } ?: knownDurationMs
         if (durationMs <= 0L) return null
         return AutoMixTrackAnalysis(
@@ -93,43 +169,101 @@ class AutoMixTrackAnalyzer @Inject constructor(
         )
     }
 
-    private suspend fun resolveAnalysisUri(item: MediaItem): Uri? {
+    /**
+     * The bytes AutoMix may read for [item], in playback-policy order: a usable
+     * file already on the device first; only then a cached or newly resolved
+     * stream, and only while Stream only permits network playback. Internal
+     * only so the source-order tests can call it without decoding anything.
+     */
+    internal suspend fun resolveAnalysisUri(item: MediaItem): Uri? {
+        currentCoroutineContext().ensureActive()
         val uri = item.localConfiguration?.uri ?: return null
-        return when (uri.scheme?.lowercase()) {
-            "file", "content", "http", "https", "android.resource" -> uri
-            STASH_RESOLVE_SCHEME -> resolvePlaceholderUri(item, uri)
+        val scheme = uri.scheme?.lowercase()
+        return when {
+            scheme in LOCAL_SCHEMES -> uri
+            scheme == STASH_RESOLVE_SCHEME -> resolvePlaceholderUri(item, uri)
+            scheme in NETWORK_SCHEMES -> {
+                // A direct stream URL can name a track that finished downloading
+                // after the queue item was built. The usable file wins, just as
+                // it does for playback; Download mode then rejects the remote URL.
+                usableLocalUri(trackIdFor(item, uri)?.let { trackDao.getById(it) })
+                    ?: uri.takeIf { remotePolicy.isAllowed() }
+            }
             else -> null
         }
     }
 
     private suspend fun resolvePlaceholderUri(item: MediaItem, uri: Uri): Uri? {
-        val trackId = uri.lastPathSegment?.toLongOrNull()
-            ?: item.mediaMetadata.extras?.getLong(StashPlaybackService.EXTRA_TRACK_ID, -1L)?.takeIf { it > 0L }
-            ?: item.mediaId.toLongOrNull() ?: return null
-        streamUrlCache.get(trackId)?.let { cached -> playableUri(cached)?.let { return it } }
+        val trackId = trackIdFor(item, uri) ?: return null
         val entity = placeholderEntity(trackDao, trackId, uri) ?: return null
-        entity.filePath?.takeIf { entity.isDownloaded && it.isNotBlank() }?.let { path ->
-            return if (path.startsWith("/")) Uri.parse("file://$path") else Uri.parse(path)
+
+        // A completed download is checked before the stream-URL cache and the
+        // resolver, using playback's shared usable-download test (#730): a
+        // failed download can leave a tiny error body behind under a row that
+        // is merely marked downloaded.
+        usableLocalUri(entity)?.let { return it }
+
+        streamUrlCache.get(trackId)?.let { cached ->
+            // Playback has already chosen this source. If it is an adaptive
+            // manifest, a preview, or otherwise not a progressive file the
+            // extractor can read, there is no analysis source for this item:
+            // do not resolve a different URL merely for AutoMix and overwrite
+            // the URL playback is about to use.
+            val playable = playableUri(cached) ?: return null
+            return playable.takeIf { !playable.isNetworkUri() || remotePolicy.isAllowed() }
         }
-        val resolved = streamResolver.resolve(entity, speculative = true) ?: return null
-        val playable = playableUri(resolved) ?: return null
-        streamUrlCache.put(trackId, resolved)
-        return playable
+        if (!remotePolicy.isAllowed()) return null
+
+        return remotePolicy.withCancellation {
+            currentCoroutineContext().ensureActive()
+            val resolved = streamResolver.resolve(entity, speculative = true) ?: return@withCancellation null
+            val playable = playableUri(resolved) ?: return@withCancellation null
+            if (playable.isNetworkUri() && !remotePolicy.isAllowed()) return@withCancellation null
+            streamUrlCache.put(trackId, resolved)
+            playable
+        }
+    }
+
+    private fun trackIdFor(item: MediaItem, uri: Uri): Long? =
+        uri.takeIf { it.scheme?.lowercase() == STASH_RESOLVE_SCHEME }?.lastPathSegment?.toLongOrNull()
+            ?: item.mediaMetadata.extras?.getLong(StashPlaybackService.EXTRA_TRACK_ID, -1L)?.takeIf { it > 0L }
+            ?: item.mediaId.toLongOrNull()
+
+    private suspend fun usableLocalUri(entity: TrackEntity?): Uri? {
+        val track = entity ?: return null
+        // usableDownload stats the file/SAF document, so keep it off the caller thread.
+        return withContext(Dispatchers.IO) { track.usableDownload(context) }
     }
 
     private fun playableUri(stream: StreamUrl): Uri? {
-        if (stream.isDash || stream.origin == CloudCopyFinder.ORIGIN) return null
+        // MediaExtractor needs one progressive, full-length file. Adaptive
+        // manifests and preview samples are playback sources, not analysis
+        // sources, so do not spend a decode (or a network extraction) on them.
+        if (stream.isDash || stream.isHls || stream.isPreview || stream.origin == CloudCopyFinder.ORIGIN) return null
         val uri = runCatching { Uri.parse(stream.url) }.getOrNull() ?: return null
-        return uri.takeIf { it.scheme?.lowercase() in setOf("file", "content", "http", "https", "android.resource") }
+        return uri.takeIf { it.scheme?.lowercase() in LOCAL_SCHEMES || it.scheme?.lowercase() in NETWORK_SCHEMES }
     }
+
+    private fun Uri.isNetworkUri(): Boolean = scheme?.lowercase() in NETWORK_SCHEMES
 
     private data class DecodedWindow(val samples: FloatArray, val sampleRate: Int, val windowStartMs: Long, val durationMs: Long)
 
-    private fun decodeWindow(uri: Uri, window: AutoMixWindow, knownDurationMs: Long): DecodedWindow? {
+    private suspend fun decodeWindow(uri: Uri, window: AutoMixWindow, knownDurationMs: Long): DecodedWindow? {
+        currentCoroutineContext().ensureActive()
+        if (uri.isNetworkUri() && !remotePolicy.isAllowed()) return null
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
+        // The deadline starts before setDataSource: for a network URI that call
+        // is part of the extraction being bounded, not free time before it.
+        val deadline = SystemClock.elapsedRealtime() + DECODE_DEADLINE_MS
         try {
-            extractor.setDataSource(context, uri, null)
+            // runInterruptible makes caller/Download-mode cancellation interrupt
+            // this blocking native open instead of merely being noticed after it
+            // eventually returns. The caller-owned checks below bound the rest.
+            runInterruptible { extractor.setDataSource(context, uri, null) }
+            currentCoroutineContext().ensureActive()
+            if (SystemClock.elapsedRealtime() >= deadline) return null
+            if (uri.isNetworkUri() && !remotePolicy.isAllowed()) return null
             var audioTrack = -1
             var format: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -150,7 +284,13 @@ class AutoMixTrackAnalyzer @Inject constructor(
                 }
             }
             extractor.selectTrack(audioTrack)
-            if (windowStartMs > 0L) extractor.seekTo(windowStartMs * 1_000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            if (windowStartMs > 0L) {
+                runInterruptible {
+                    extractor.seekTo(windowStartMs * 1_000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                }
+            }
+            currentCoroutineContext().ensureActive()
+            if (SystemClock.elapsedRealtime() >= deadline) return null
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
             codec.start()
@@ -162,20 +302,23 @@ class AutoMixTrackAnalyzer @Inject constructor(
             var inputEos = false
             var outputEos = false
             val bufferInfo = MediaCodec.BufferInfo()
-            val deadline = SystemClock.elapsedRealtime() + DECODE_DEADLINE_MS
             while (!outputEos && sampleCount < maxSamples && SystemClock.elapsedRealtime() < deadline) {
+                // Codec calls below use a 10 ms timeout, so this check is reached
+                // promptly throughout the decode; a cancelled caller throws here
+                // and the finally block releases the codec and extractor.
+                currentCoroutineContext().ensureActive()
                 if (!inputEos) {
                     val inputIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US)
                     if (inputIndex >= 0) {
                         val inputBuffer = codec.getInputBuffer(inputIndex) ?: continue
                         inputBuffer.clear()
-                        val size = extractor.readSampleData(inputBuffer, 0)
+                        val size = runInterruptible { extractor.readSampleData(inputBuffer, 0) }
                         if (size < 0) {
                             codec.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputEos = true
                         } else {
                             codec.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime.coerceAtLeast(0L), 0)
-                            extractor.advance()
+                            runInterruptible { extractor.advance() }
                         }
                     }
                 }
@@ -241,6 +384,7 @@ class AutoMixTrackAnalyzer @Inject constructor(
         const val DECODE_DEADLINE_MS = 45_000L
         const val CODEC_TIMEOUT_US = 10_000L
         const val MAX_SAMPLES = 7_000_000
-        const val MAX_CACHED_ANALYSES = 24
+        val LOCAL_SCHEMES = setOf("file", "content", "android.resource")
+        val NETWORK_SCHEMES = setOf("http", "https")
     }
 }

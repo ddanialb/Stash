@@ -3,6 +3,12 @@ package com.stash.core.media.automix
 import com.google.common.truth.Truth.assertThat
 import kotlin.math.PI
 import kotlin.math.sin
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class AutoMixBeatAnalyzerTest {
@@ -25,7 +31,7 @@ class AutoMixBeatAnalyzerTest {
             samples[i] += (0.035 * sin(2.0 * PI * 55.0 * i / sampleRate)).toFloat()
         }
 
-        val analysis = AutoMixBeatAnalyzer.analyze(samples, sampleRate, windowStartMs = 0L)
+        val analysis = runBlocking { AutoMixBeatAnalyzer.analyze(samples, sampleRate, windowStartMs = 0L) }
         assertThat(analysis).isNotNull()
         val grid = analysis!!.beatGrid
         assertThat(grid).isNotNull()
@@ -59,7 +65,7 @@ class AutoMixBeatAnalyzerTest {
             samples[i] = value.toFloat().coerceIn(-1f, 1f)
         }
 
-        val analysis = AutoMixBeatAnalyzer.analyze(samples, sampleRate, windowStartMs = 0L)
+        val analysis = runBlocking { AutoMixBeatAnalyzer.analyze(samples, sampleRate, windowStartMs = 0L) }
         assertThat(analysis).isNotNull()
         assertThat(analysis!!.musicalKey).isNotNull()
         assertThat(analysis.musicalKey!!.rootPitchClass).isEqualTo(0)
@@ -67,5 +73,27 @@ class AutoMixBeatAnalyzerTest {
         assertThat(analysis.sections).isNotEmpty()
         assertThat(analysis.sections.maxOf { it.melodic }).isAtLeast(0.40f)
         assertThat(analysis.sections.maxOf { it.sustained }).isAtLeast(0.65f)
+    }
+
+    @Test fun `cancelling the caller stops the DSP loops`() {
+        runBlocking {
+            val sampleRate = 44_100
+            // A full-size 65-second window: thousands of framing and FFT iterations,
+            // far more than can finish before the cancellation below lands.
+            val samples = FloatArray(sampleRate * 65) { index ->
+                val beatPulse = if (index % (sampleRate / 2) < 256) 0.7f else 0f
+                beatPulse + (0.05 * sin(2.0 * PI * 440.0 * index / sampleRate)).toFloat()
+            }
+
+            val analysis = async(Dispatchers.Default) {
+                AutoMixBeatAnalyzer.analyze(samples, sampleRate, windowStartMs = 0L)
+            }
+            delay(5)
+            analysis.cancel()
+
+            assertThrows(CancellationException::class.java) {
+                runBlocking { analysis.await() }
+            }
+        }
     }
 }

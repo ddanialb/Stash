@@ -109,6 +109,14 @@ class StashPlaybackService : MediaLibraryService() {
      * and the player skips it. A song from a file plays on undisturbed.
      */
     private fun dropStreamsForDownloadMode() {
+        // Any analysis/plan was made for the pre-switch pair. Cancelling the
+        // service job also cancels the caller-owned analyzer work immediately;
+        // the analyzer's own policy watcher is the second line of defence.
+        clearAutoMixPlan()
+        if (autoMixFiredPlan != null) {
+            autoMixFiredPlan = null
+            autoMixStateBus.clear()
+        }
         val engine = crossfadeEngine ?: return
         if (engine.isTransitioning()) engine.cancelTransition()
         val p = engine.masterPlayer

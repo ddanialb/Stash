@@ -1,5 +1,7 @@
 package com.stash.core.media.automix
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -120,11 +122,14 @@ object AutoMixBeatAnalyzer {
     private const val MIN_ONSET_STRENGTH = 0.035f
     private const val FFT_SIZE = 4096
     private const val FFT_HOP = 2048
+    /** Check for cancellation every 256 frames/iterations in the long DSP loops. */
+    private const val CANCELLATION_CHECK_MASK = 0xFF
 
     private val MAJOR_PROFILE = doubleArrayOf(6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
     private val MINOR_PROFILE = doubleArrayOf(6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
 
-    fun analyze(samples: FloatArray, sampleRate: Int, windowStartMs: Long): BeatWindowAnalysis? {
+    suspend fun analyze(samples: FloatArray, sampleRate: Int, windowStartMs: Long): BeatWindowAnalysis? {
+        currentCoroutineContext().ensureActive()
         if (sampleRate <= 0 || samples.size < sampleRate * 2) return null
         val windowDurationMs = samples.size * 1_000L / sampleRate
         val windowEndMs = windowStartMs + windowDurationMs
@@ -135,6 +140,7 @@ object AutoMixBeatAnalyzer {
         val highFrequency = FloatArray(frames)
         val brightnessRatio = FloatArray(frames)
         for (frame in 0 until frames) {
+            if (frame and CANCELLATION_CHECK_MASK == 0) currentCoroutineContext().ensureActive()
             val start = frame * HOP_SIZE
             val end = min(samples.size, start + FRAME_SIZE)
             var squares = 0.0
@@ -162,10 +168,11 @@ object AutoMixBeatAnalyzer {
             return BeatWindowAnalysis(null, effectiveStartMs, effectiveEndMs, null)
         }
         val normalizedNovelty = FloatArray(novelty.size) { novelty[it] / rmsP95 }
+        currentCoroutineContext().ensureActive()
         val spectral = analyzeSpectrum(samples, sampleRate)
         val musicalKey = spectral.key
 
-        fun noGrid(): BeatWindowAnalysis {
+        suspend fun noGrid(): BeatWindowAnalysis {
             val sections = buildSections(
                 grid = null, rms = rms, novelty = normalizedNovelty, brightness = brightnessRatio,
                 spectralFrames = spectral.frames,
@@ -185,7 +192,9 @@ object AutoMixBeatAnalyzer {
 
         if (percentile(normalizedNovelty, 0.95f) < MIN_ONSET_STRENGTH) return noGrid()
         val envelopeRate = sampleRate.toDouble() / HOP_SIZE.toDouble()
+        currentCoroutineContext().ensureActive()
         val candidate = bestTempo(normalizedNovelty, envelopeRate) ?: return noGrid()
+        currentCoroutineContext().ensureActive()
         val refined = refineTempo(normalizedNovelty, envelopeRate, candidate.first)
         val periodFrames = 60.0 * envelopeRate / refined.bpm
         val downbeatOffset = bestDownbeatOffset(normalizedNovelty, periodFrames, refined.phaseFrame)
@@ -197,6 +206,7 @@ object AutoMixBeatAnalyzer {
             stability = tempoStability(normalizedNovelty, envelopeRate),
             beatStrength = refined.beatStrength,
         )
+        currentCoroutineContext().ensureActive()
         val entryGrid = localBeatGrid(
             global = grid,
             novelty = normalizedNovelty,
@@ -205,6 +215,7 @@ object AutoMixBeatAnalyzer {
             windowStartMs = windowStartMs,
             atStart = true,
         )
+        currentCoroutineContext().ensureActive()
         val exitGrid = localBeatGrid(
             global = grid,
             novelty = normalizedNovelty,
@@ -216,11 +227,13 @@ object AutoMixBeatAnalyzer {
         val firstStrong = firstStrongDownbeat(
             entryGrid, rms, normalizedNovelty, sampleRate, windowStartMs, effectiveStartMs, windowEndMs,
         )
+        currentCoroutineContext().ensureActive()
         val sections = buildSections(
             grid = grid, rms = rms, novelty = normalizedNovelty, brightness = brightnessRatio,
             spectralFrames = spectral.frames,
             sampleRate = sampleRate, windowStartMs = windowStartMs, windowEndMs = windowEndMs,
         )
+        currentCoroutineContext().ensureActive()
         return BeatWindowAnalysis(
             beatGrid = grid,
             effectiveStartMs = effectiveStartMs,
@@ -276,7 +289,7 @@ object AutoMixBeatAnalyzer {
         return rms.lastIndex
     }
 
-    private fun buildSections(
+    private suspend fun buildSections(
         grid: BeatGrid?,
         rms: FloatArray,
         novelty: FloatArray,
@@ -286,6 +299,7 @@ object AutoMixBeatAnalyzer {
         windowStartMs: Long,
         windowEndMs: Long,
     ): List<AutoMixSection> {
+        currentCoroutineContext().ensureActive()
         val ranges = ArrayList<Pair<Long, Long>>()
         if (grid != null) {
             val barMs = (grid.beatIntervalMs * 4.0).roundToLong().coerceAtLeast(250L)
@@ -309,7 +323,8 @@ object AutoMixBeatAnalyzer {
         val rmsScale = percentile(rms, 0.95f).takeIf { it > 1e-9f } ?: 1f
         val noveltyScale = percentile(novelty, 0.95f).takeIf { it > 1e-9f } ?: 1f
         val brightnessScale = percentile(brightness, 0.95f).takeIf { it > 1e-9f } ?: 1f
-        return ranges.map { (startMs, endMs) ->
+        return ranges.mapIndexed { index, (startMs, endMs) ->
+            if (index and 0xF == 0) currentCoroutineContext().ensureActive()
             val from = timeToFrame(startMs, windowStartMs, sampleRate, rms.size)
             val toExclusive = (timeToFrame(endMs, windowStartMs, sampleRate, rms.size) + 1).coerceIn(from + 1, rms.size)
             var rmsSum = 0.0
@@ -415,11 +430,15 @@ object AutoMixBeatAnalyzer {
         return best?.endMs
     }
 
-    private fun bestTempo(novelty: FloatArray, envelopeRate: Double): Pair<Double, Float>? {
+    private suspend fun bestTempo(novelty: FloatArray, envelopeRate: Double): Pair<Double, Float>? {
+        currentCoroutineContext().ensureActive()
         val mean = novelty.average().toFloat()
         val centered = FloatArray(novelty.size) { novelty[it] - mean }
         val prefixSquares = DoubleArray(centered.size + 1)
-        for (i in centered.indices) prefixSquares[i + 1] = prefixSquares[i] + centered[i].toDouble() * centered[i]
+        for (i in centered.indices) {
+            if (i and CANCELLATION_CHECK_MASK == 0) currentCoroutineContext().ensureActive()
+            prefixSquares[i + 1] = prefixSquares[i] + centered[i].toDouble() * centered[i]
+        }
         if (prefixSquares.last() <= 1e-12) return null
         val minLag = floor(60.0 * envelopeRate / MAX_BPM).toInt().coerceAtLeast(1)
         val maxLag = ceil(60.0 * envelopeRate / MIN_BPM).toInt().coerceAtMost(centered.size / 3)
@@ -428,6 +447,7 @@ object AutoMixBeatAnalyzer {
         var bestLag = minLag
         var bestScore = Double.NEGATIVE_INFINITY
         for (lag in minLag..maxLag) {
+            if ((lag - minLag) and 0x7 == 0) currentCoroutineContext().ensureActive()
             var dot = 0.0
             for (i in lag until centered.size) dot += centered[i].toDouble() * centered[i - lag]
             val leftEnergy = prefixSquares[centered.size - lag]
@@ -474,12 +494,14 @@ object AutoMixBeatAnalyzer {
      * comb. This is important over a 65-second window: even a 0.5 BPM error
      * walks several hundred milliseconds by the outro and makes kicks flam.
      */
-    private fun refineTempo(novelty: FloatArray, envelopeRate: Double, coarseBpm: Double): RefinedTempo {
+    private suspend fun refineTempo(novelty: FloatArray, envelopeRate: Double, coarseBpm: Double): RefinedTempo {
+        currentCoroutineContext().ensureActive()
         var bestBpm = coarseBpm
         var bestPeriod = 60.0 * envelopeRate / coarseBpm
         var bestPhase = bestPhase(novelty, bestPeriod)
         var bestScore = phaseScore(novelty, bestPeriod, bestPhase.toDouble())
         for (step in -30..30) {
+            if ((step + 30) and 0x7 == 0) currentCoroutineContext().ensureActive()
             if (step == 0) continue
             val bpm = coarseBpm * (1.0 + step * 0.001)
             if (bpm !in MIN_BPM..MAX_BPM) continue
@@ -507,7 +529,7 @@ object AutoMixBeatAnalyzer {
      * edges, and a globally correct BPM can still leave the edge phase far
      * enough out to make a loop seam or two kicks audibly separate.
      */
-    private fun localBeatGrid(
+    private suspend fun localBeatGrid(
         global: BeatGrid,
         novelty: FloatArray,
         envelopeRate: Double,
@@ -515,6 +537,7 @@ object AutoMixBeatAnalyzer {
         windowStartMs: Long,
         atStart: Boolean,
     ): BeatGrid {
+        currentCoroutineContext().ensureActive()
         if (novelty.size < 240) return global
         val desiredFrames = (24.0 * envelopeRate).roundToInt()
         val localSize = desiredFrames.coerceIn(min(600, novelty.size), novelty.size)
@@ -547,10 +570,12 @@ object AutoMixBeatAnalyzer {
         )
     }
 
-    private fun tempoStability(novelty: FloatArray, envelopeRate: Double): Float {
+    private suspend fun tempoStability(novelty: FloatArray, envelopeRate: Double): Float {
+        currentCoroutineContext().ensureActive()
         if (novelty.size < 1_200) return 0.45f
         val mid = novelty.size / 2
         val first = bestTempo(novelty.copyOfRange(0, mid), envelopeRate)?.first ?: return 0.35f
+        currentCoroutineContext().ensureActive()
         val second = bestTempo(novelty.copyOfRange(mid, novelty.size), envelopeRate)?.first ?: return 0.35f
         var ratio = first / second
         while (ratio < 0.75) ratio *= 2.0
@@ -577,11 +602,12 @@ object AutoMixBeatAnalyzer {
         return if (count == 0) 0.0 else score / count
     }
 
-    private fun bestPhase(novelty: FloatArray, periodFrames: Double): Int {
+    private suspend fun bestPhase(novelty: FloatArray, periodFrames: Double): Int {
         val steps = max(1, periodFrames.roundToInt())
         var bestOffset = 0
         var bestScore = Double.NEGATIVE_INFINITY
         for (offset in 0 until steps) {
+            if (offset and 0x7 == 0) currentCoroutineContext().ensureActive()
             val average = phaseScore(novelty, periodFrames, offset.toDouble())
             if (average > bestScore) {
                 bestScore = average
@@ -651,7 +677,8 @@ object AutoMixBeatAnalyzer {
      * drums tend to fail the tonal half and a bass line tends to fail the
      * mid-band half. This is only a conservative veto for transitions.
      */
-    private fun analyzeSpectrum(samples: FloatArray, sampleRate: Int): SpectralAnalysis {
+    private suspend fun analyzeSpectrum(samples: FloatArray, sampleRate: Int): SpectralAnalysis {
+        currentCoroutineContext().ensureActive()
         if (samples.size < FFT_SIZE || sampleRate <= 0) return SpectralAnalysis(null, emptyList())
         val chroma = DoubleArray(12)
         val frames = ArrayList<SpectralFrame>()
@@ -661,6 +688,7 @@ object AutoMixBeatAnalyzer {
         var start = 0
         var usedFrames = 0
         while (start + FFT_SIZE <= samples.size) {
+            if ((start / FFT_HOP) and 0xF == 0) currentCoroutineContext().ensureActive()
             var energy = 0.0
             for (i in 0 until FFT_SIZE) {
                 val sample = samples[start + i].toDouble()
